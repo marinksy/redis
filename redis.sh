@@ -1,102 +1,125 @@
 #!/bin/bash
 
-# Script to install and configure Redis on AlmaLinux 9 with cPanel
+set -e
 
-# Ensure the script is run as root or with sudo privileges
+# =====================================================
+# Redis installer for AlmaLinux 9 + cPanel
+# Safe + idempotent version
+# =====================================================
+
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run this script as root or with sudo privileges."
+    echo "Please run this script as root."
     exit 1
 fi
 
-# Step 1: Update the system
-echo "Updating the system..."
-dnf update -y
+echo "=== Updating system ==="
+dnf -y update
 
-# Step 2: Install the EPEL repository
-echo "Installing the EPEL repository..."
-dnf install epel-release -y
+echo "=== Installing EPEL (if missing) ==="
+dnf -y install epel-release
 
-# Step 3: Install Redis
-echo "Installing Redis..."
-dnf install redis -y
+echo "=== Installing Redis (if missing) ==="
+if ! rpm -q redis >/dev/null 2>&1; then
+    dnf -y install redis
+else
+    echo "Redis already installed."
+fi
 
-# Step 4: Start and enable Redis service
-echo "Starting and enabling Redis service..."
-systemctl start redis
+echo "=== Enabling and starting Redis ==="
 systemctl enable redis
+systemctl start redis
 
-# Step 5: Verify Redis installation
-echo "Verifying Redis installation..."
-systemctl status redis | grep "Active: active (running)" > /dev/null 2>&1
+sleep 2
 
-if [ $? -eq 0 ]; then
-    echo "Redis is running successfully."
-else
-    echo "Failed to start Redis. Please check the system logs for more information."
+if ! systemctl is-active --quiet redis; then
+    echo "Redis failed to start."
     exit 1
 fi
 
-# Step 6: Test Redis
-echo "Testing Redis installation..."
-redis-cli ping | grep "PONG" > /dev/null 2>&1
+echo "Redis is running."
 
-if [ $? -eq 0 ]; then
-    echo "Redis responded with PONG. Installation successful."
-else
-    echo "Redis did not respond as expected. Please troubleshoot."
+echo "=== Testing Redis ==="
+if ! redis-cli ping | grep -q PONG; then
+    echo "Redis test failed."
     exit 1
 fi
 
-# Step 7: Configure Redis
-echo "Configuring Redis..."
+echo "Redis test successful."
 
 REDIS_CONF="/etc/redis.conf"
 
-# Backup the original Redis configuration
-cp $REDIS_CONF ${REDIS_CONF}.backup
+echo "=== Backing up redis.conf ==="
+cp -n $REDIS_CONF ${REDIS_CONF}.backup
 
-# Step 7.1: Leave only "save 300 10"
+echo "=== Configuring Redis ==="
+
+# Remove existing save lines
 sed -i '/^save /d' $REDIS_CONF
 echo "save 300 10" >> $REDIS_CONF
 
-# Step 7.2: Add or edit maxclients to 2000
+# Secure binding (IMPORTANT for cPanel servers)
+sed -i 's/^bind .*/bind 127.0.0.1/' $REDIS_CONF
+sed -i 's/^protected-mode .*/protected-mode yes/' $REDIS_CONF
+
+# Maxclients
 if grep -q "^maxclients" $REDIS_CONF; then
-    sed -i "s/^maxclients.*/maxclients 2000/" $REDIS_CONF
+    sed -i 's/^maxclients .*/maxclients 2000/' $REDIS_CONF
 else
     echo "maxclients 2000" >> $REDIS_CONF
 fi
 
-# Step 7.3: Set maxmemory to one-quarter of total RAM
-total_ram=$(free -m | awk '/Mem:/ { print $2 }')
+# Calculate maxmemory = 25% RAM
+total_ram=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 quarter_ram=$(($total_ram / 4))M
-if grep -q "^maxmemory" $REDIS_CONF; then
-    sed -i "s/^maxmemory.*/maxmemory $quarter_ram/" $REDIS_CONF
+
+if grep -q "^maxmemory " $REDIS_CONF; then
+    sed -i "s/^maxmemory .*/maxmemory $quarter_ram/" $REDIS_CONF
 else
     echo "maxmemory $quarter_ram" >> $REDIS_CONF
 fi
 
-# Step 7.4: Set maxmemory-policy to allkeys-lru
+# Memory policy
 if grep -q "^maxmemory-policy" $REDIS_CONF; then
-    sed -i "s/^maxmemory-policy.*/maxmemory-policy allkeys-lru/" $REDIS_CONF
+    sed -i 's/^maxmemory-policy .*/maxmemory-policy allkeys-lru/' $REDIS_CONF
 else
     echo "maxmemory-policy allkeys-lru" >> $REDIS_CONF
 fi
 
-# Step 8: Configure CSF to open port 6379
-echo "Opening port 6379 in CSF..."
-csf_config="/etc/csf/csf.conf"
-
-# Allow port 6379 in TCP_IN and TCP_OUT
-sed -i "/^TCP_IN =/ s/\"/\",6379/" $csf_config
-sed -i "/^TCP_OUT =/ s/\"/\",6379/" $csf_config
-
-# Restart CSF to apply changes
-csf -r
-
-# Step 9: Restart Redis to apply configuration changes
-echo "Restarting Redis to apply configuration changes..."
+echo "=== Restarting Redis ==="
 systemctl restart redis
 
-# Final message
-echo "Redis installation and configuration completed successfully."
-echo "Redis is now installed and running on your AlmaLinux 9 system with cPanel."
+sleep 2
+
+if ! redis-cli ping | grep -q PONG; then
+    echo "Redis restart failed."
+    exit 1
+fi
+
+echo "Redis configuration applied successfully."
+
+# =====================================================
+# OPTIONAL: Open port in CSF (NOT recommended unless needed)
+# =====================================================
+
+OPEN_EXTERNAL=false   # change to true if you REALLY need external access
+
+if [ "$OPEN_EXTERNAL" = true ]; then
+    echo "Opening port 6379 in CSF..."
+
+    if command -v csf >/dev/null 2>&1; then
+        csf -a 6379 redis
+        csf -r
+        echo "Port 6379 opened in CSF."
+    else
+        echo "CSF not installed. Skipping."
+    fi
+else
+    echo "Redis configured for localhost only. Port 6379 NOT exposed."
+fi
+
+echo "==========================================="
+echo "Redis installation complete."
+echo "Bind address: 127.0.0.1"
+echo "Maxmemory: $quarter_ram"
+echo "Maxclients: 2000"
+echo "==========================================="
